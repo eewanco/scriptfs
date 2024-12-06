@@ -39,7 +39,7 @@ struct Persistent {
 	size_t mirror_len;	//!< Length of the mirror string
 	int mirror_fd;	//!< File descriptor of the mirror folder
 	Procedures *procs;	//!< List of procedures describing what to do with files
-} persistent;	//!< Variable holding all the persistent data needed by the application
+};
 
 /**
  * \brief Data saved about an opened file

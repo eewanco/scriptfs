@@ -30,6 +30,9 @@
 /********************************************/
 /*         DATA TYPES AND FUNCTIONS         */
 /********************************************/
+
+struct Persistent persistent;
+
 void init_resources() {
 	persistent.mirror=0;
 	persistent.mirror_len=0;

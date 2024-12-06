@@ -39,6 +39,8 @@
 #include "operations.h"
 #include "procedures.h"
 
+extern struct Persistent persistent;
+
 #define SFS_OPT_KEY(t,u,p) { t ,offsetof(struct options, p ), 1 } , { u ,offsetof(struct options, p ), 1 }	//!< Generate a command-line argument with short name t, long name u. p is an integer variable name and the corresponding variable will be set to 1 if it is found in the arguments
 #define SFS_OPT_KEY2(t,u,p,v) { t ,offsetof(struct options, p ), v } , { u ,offsetof(struct options, p ), v }	//!< Generate a command-line argument with short name t, long name u. p is an integer or string variable name and the corresponding variable will be set to the value of the argument
 
