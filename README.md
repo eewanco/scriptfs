@@ -4,6 +4,32 @@ ScriptFS is a new file system which merely replicates a local file system, but r
 
 Any script is supported. In a usual way of working, ScriptFS reads on its command line the name of two programs : one that is the script interpretor, and the other one a lightweight program that tells fast if a file on the disk is a script that can be read by the first program.
 
+## Setup
+### Manual using Makefile
+
+This requires appropriate c buildtools as well as fuse and libfuse-dev to be installed.  
+
+`make`
+
+### As container image
+
+Use the most recent pre-built image from [Github](https://github.com/Horstexplorer/scriptfs/pkgs/container/scriptfs) or create the image yourself. No additional build tools are required to be installed.
+
+`ghcr.io/horstexplorer/scriptfs:<most_recent_tag>`
+
+```
+services:
+  scriptfs:
+    image: ghcr.io/horstexplorer/scriptfs:<most_recent_tag>
+    container_name: scriptfs
+    stdin_open: true    # Demo
+    tty: true           # Demo
+    volumes:
+      - /dev/fuse:/dev/fuse
+```
+
+
+
 ## Usage
 ### Command line
 
