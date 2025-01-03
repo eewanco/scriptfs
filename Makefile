@@ -35,8 +35,5 @@ clean:
 	@rm -f $(SRC_DIR)/*.o
 	@rm -f $(PROJECT)
 
-doc:
-	@doxygen doxyconf
-
 archive:
 	@tar -cvjf $(PROJECT).tar.bz2 $(SRC_DIR)/*.c $(SRC_DIR)/*.h Makefile
