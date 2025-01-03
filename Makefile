@@ -18,28 +18,25 @@ endif
 CFLAGS=$(CINCFLAGS) $(COPTFLAGS) $(CPROFFLAGS) $(CTRACEFLAGS) `pkg-config fuse --cflags` 
 LFLAGS=`pkg-config fuse --libs` 
 
-BIN=.
 PROJECT=scriptfs
+SRC_DIR=src
 
-all:$(BIN)/$(PROJECT)
+all:$(PROJECT)
 
-$(BIN)/$(PROJECT):$(PROJECT).c $(BIN)/procedures.o $(BIN)/operations.o
+$(PROJECT):$(SRC_DIR)/scriptfs.c $(SRC_DIR)/procedures.o $(SRC_DIR)/operations.o
 	@echo --------------- Linking of executable ---------------
-	@$(CC) $(CFLAGS) -o $(BIN)/$(PROJECT) $^ $(LFLAGS)
+	@$(CC) $(CFLAGS) -o $(PROJECT) $^ $(LFLAGS)
 
-$(BIN)/operations.o:operations.h
-
-$(BIN)/procedures.o:procedures.h
-
-$(BIN)/%.o:%.c %.h
+./%.o:%.c %.h
 	@echo --------------- Compilation of $< ---------------
-	@$(CC) $(CFLAGS) -c -o $(BIN)/$@ $<
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	@rm *.o
+	@rm -f $(SRC_DIR)/*.o
+	@rm -f $(PROJECT)
 
 doc:
 	@doxygen doxyconf
 
 archive:
-	@tar -cvjf $(PROJECT).tar.bz2 *.c *.h Makefile
+	@tar -cvjf $(PROJECT).tar.bz2 $(SRC_DIR)/*.c $(SRC_DIR)/*.h Makefile
