@@ -5,12 +5,12 @@
  *
  *    Description:  Implementation of operations on script files
  *
- *        Version:  1.0
- *        Created:  08/05/2012 15:13:31
+ *        Version:  2.0
+ *        Created:  01/25/2025
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  François Hissel
+ *         Author:  Eric Ewanco (2.0) François Hissel (1.0)
  *        Company:  
  *
  * =====================================================================================
@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -55,15 +56,31 @@ void free_resources() {
  * \return New string with the name of the temporary file. The user is responsible for releasing the memory allocated for this string.
  */
 char *temp_copy(const char *file) {
-	char *res=0;
 	int fin=openat(persistent.mirror_fd,file,O_RDONLY);
 	if (fin==-1) return 0;
-	res=tempnam("/tmp","sfs.");
-	int fout=open(res,O_CREAT | O_WRONLY | O_TRUNC | O_EXCL,S_IRUSR | S_IXUSR);
-	if (fout==-1) {close(fin);return 0;}
-	ssize_t num;
-	char buf[0x1000];
-	while ((num=read(fin,&buf,0x1000*sizeof(char)))>0) write(fout,&buf,num);
+	char *res = strdup(persistent.tmp_template);
+	int fout=mkstemp(res);
+	if (fout==-1) {
+		fprintf(stderr,"temp_copy: Failed to create temp file (%d)\n", errno);
+		close(fin);
+		return 0;
+	}
+	ssize_t num, total = 0;
+	char buf[0x400];
+	while ((num = read(fin, &buf, sizeof(buf))) > 0) {
+		write(fout, &buf, num);
+		total += num;
+	}
+	struct stat st;
+	int code = fstat(fin, &st);
+	if (code==-1) {
+#ifdef TRACE
+		fprintf(stderr,"temp_copy: Warning: Cannot stat mode for copy: %s\n", strerror(errno));
+#endif
+	} else {
+		/* Otherwise any executable bit won't get transferred */
+		fchmod(fout, st.st_mode & (S_IRUSR | S_IXUSR));
+	}
 	close(fin);
 	close(fout);
 	return res;
@@ -106,6 +123,8 @@ int test_program(PTest test,const char *file) {
 	const char *f=(test->filter)?file:0;
 	// Launch the program
 	int code=execute_program(test->path,(const char**)(test->args),0,f);
+	if (test->args && test->filearg)
+		*(test->filearg) = strdup(""); // A hack to give it something non-zero to free() to avoid errors
 	return (code==0);
 }
 
@@ -113,6 +132,9 @@ int test_program(PTest test,const char *file) {
 /*           EXECUTION FUNCTIONS            */
 /********************************************/
 int program_shell(PProgram program,const char *file,int fd) {
+#ifdef TRACE
+	fprintf(stderr,"program_shell(%s, %d)\n",file, fd);
+#endif
 	char *tmpfil=temp_copy(file);
 	if (tmpfil==0) return -errno;
 	const char *args[]={tmpfil,0};
@@ -124,7 +146,7 @@ int program_shell(PProgram program,const char *file,int fd) {
 
 int program_external(PProgram program,const char *file,int fd) {
 	// Create the array of arguments of the program by replacing the exclamation mark with the name of a file with the same content
-	// The actual file is not used because it may not be accessible for external programs since the host folder can be mounted over with the new file system. To prevent that case, the script file is copied in the temporary folder and this new file name is given as the argument of the external program at the location of the exclamation mark. The temporary file is deleted after the end of the procedure.
+	// The actual file is not used because it may not be accessible for external programs since the host folder can be mounted over with the new file system [this is no longer true, but I am leaving the code --eje]. To prevent that case, the script file is copied in the temporary folder and this new file name is given as the argument of the external program at the location of the exclamation mark. The temporary file is deleted after the end of the procedure.
 	if (program->args!=0 && program->filearg!=0) *(program->filearg)=temp_copy(file);
 	// If the program is a filter that requires standard input, add the name of the file in the arguments of the call to execute_program
 	const char *f=(program->filter && program->filearg==0)?file:0;
@@ -145,17 +167,36 @@ int program_external(PProgram program,const char *file,int fd) {
 /*             OTHER OPERATIONS             */
 /********************************************/
 Procedure* get_script(const Procedures *procs,const char *file) {
+#ifdef TRACE
+	fprintf(stderr,"get_script(%s)\n", file);
+#endif
 	Procedure *res=0;
 	while (res==0 && procs!=0) {
 		if (procs->procedure->test!=0 && procs->procedure->test->func!=0 && procs->procedure->test->func(procs->procedure->test,file)!=0) res=procs->procedure;
 		procs=procs->next;
 	}
+#ifdef TRACE
+	fprintf(stderr,"get_script() <-- %p\n", res);
+#endif
 	return res;
 }
 
 void call_program(const char *file,const char **args) {
+#ifdef TRACE
+	fprintf(stderr,"call_program(%s)\n", file);
+#endif
 	// Check the nature of file
 	int fd=openat(persistent.mirror_fd,file,O_RDONLY);
+	if (fd <= 0) {
+		// This is sort of an experimental hack. It's not clear from the original documentation,
+		// but apparently filters are *supposed* to be in the mirror directory, except this didn't
+		// quite work in my experience. I did some work "fixing" it (by canonicalizing filter paths)
+		// except this part broke, so this hack permits absolute paths to work. --eje
+		if ((fd = open(file, O_RDONLY)) <= 0) {
+			fprintf(stderr, "call_program: Open of file %s failed\n", file);
+			return;
+		}
+	}
 	FILE *f=fdopen(fd,"r");
 	if (f==0) return;
 	char *line=0;
@@ -163,7 +204,7 @@ void call_program(const char *file,const char **args) {
 	ssize_t n=getline(&line,&nn,f);
 	close(fd);
 	if (n>=2 && line[0]=='#' && line[1]=='!') {	// file is a shell script
-		// Read the path to the script interpretor
+		// Read the path to the script interpreter
 		size_t i=2;
 		while (i<n && (line[i]==' ' || line[i]=='\t')) ++i;
 		if (i>=n || line[i]=='\n') return;
@@ -183,14 +224,33 @@ void call_program(const char *file,const char **args) {
 		while (j<i+2) {newargs[j]=args[j-1];++j;}
 		// Launch program
 		int fde=openat(persistent.mirror_fd,path,O_RDONLY);
-		fexecve(fde,(char* const*)newargs,persistent.envp);
+#ifdef TRACE
+		fprintf(stderr,"call_program: Executing shell script with %s\n", path);
+#endif
+		if (fde > 0) {
+			fexecve(fde, (char* const*)newargs, persistent.envp);
+		} else {
+			fprintf(stderr, "call_program: Open of script %s/%s failed\n",
+				persistent.mirror, path);
+		}
 	} else {
 		int fde=openat(persistent.mirror_fd,file,O_RDONLY);
-		fexecve(fde,(char *const*)args,persistent.envp);
+#ifdef TRACE
+		fprintf(stderr, "call_program: executable file handle is %d\n", fde);
+#endif
+		if (fde > 0) {
+			fexecve(fde, (char *const*)args, persistent.envp);
+		} else {
+			fprintf(stderr, "call_program: Open of executable %s/%s failed\n",
+				persistent.mirror, file);
+		}
 	}
 }
 
 int execute_program(const char *file,const char **args,int out,const char* path_in) {
+#ifdef TRACE
+	fprintf(stderr,"execute_program(%s,..., %d, %s)\n", file, out, path_in);
+#endif
 	pid_t child;	// ID of child process executing external program
 	int fds[2];	// Handles of the two ends of the pipe, only used if input has to be provided to the standard input of the external program
 	int in;
@@ -201,10 +261,10 @@ int execute_program(const char *file,const char **args,int out,const char* path_
 			close(fds[0]);	// Close input descriptor
 			in=openat(persistent.mirror_fd,path_in,O_RDONLY);
 			if (in<0) path_in=0; else {	// Copy file to standard input
-				char buffer[0x1000];
+				char buffer[0x400];
 				ssize_t num,numw,num2;
 				do {
-					num=read(in,buffer,0x1000);
+					num=read(in, buffer, sizeof buffer);
 					numw=0;
 					while (numw<num) {
 						num2=write(fds[1],buffer+numw,num-numw);
@@ -229,9 +289,9 @@ int execute_program(const char *file,const char **args,int out,const char* path_
 		}
 		//execvp(file,(char *const *)args);
 		call_program(file,args);
-		fprintf(stderr,"Error calling external program : %s",file);
+		fprintf(stderr,"Error '%s' calling external program : %s", strerror(errno), file);
 		args++;
-		while (args!=0) fprintf(stderr," %s",*(args++));
+		while (*args!=0) fprintf(stderr," %s",*(args++));
 		fprintf(stderr,"\n");
 		abort();
 	}

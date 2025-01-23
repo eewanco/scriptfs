@@ -8,23 +8,24 @@
  *    Description:  FUSE-based file system that automatically executes scripts and
  *    							returns their output instead of the actual file content
  *
- *        Version:  1.0
- *        Created:  08/05/2012 13:26:37
+ *        Version:  2.0
+ *        Created:  01/22/2025
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  François Hissel
+ *         Author:  Eric Ewanco (2.0) François Hissel (1.0)
  *        Company:  
  *
  * =====================================================================================
  */
 
-#define	FUSE_USE_VERSION 26			//!< FUSE version on which the file system is based
+#define FUSE_USE_VERSION 314			//!< FUSE version on which the file system is based
+#define _GNU_SOURCE
 
 #include <stdlib.h>
 #include <stddef.h>
-#include <fuse.h>
-#include <fuse_opt.h>
+#include <fuse3/fuse.h>
+#include <fuse3/fuse_opt.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -56,6 +57,7 @@ gid_t gid;	//!< Current group ID
 void print_usage(int code) {
 	printf("Syntax: scriptfs [arguments] mirror_folder mount_point\n");
 	printf("Arguments:\n");
+	printf("        -l\n\t\tReport final output size for scripts instead of size of source.\n");
 	printf("	-p program[;test]\n\t\tAdd a procedure which tells what to do with files\n");
 	printf("	mirror_folder\n\t\tActual folder on the disk that will be the base folder of the mounted structure\n");
 	printf("	mount_point\n\t\tFolder that will be used as the mount point\n");
@@ -114,18 +116,45 @@ void tokenize(char *s,char ***tokens) {
 }
 
 /**
+ * \brief Run a script and return a handle to the output
+ *
+ * Given a script whose "relative path" has already been ascertained, run it and return a handle
+ * to the (open) temporary file containing its output. The file will be unlinked so it will disappear
+ * once closed.
+ * \param relative Name of script in path relative to virtual filesystem
+ * \param proc Pointer to Procedure struct of relevant script
+ * \param fi File info structure
+ * \return Negative error code, else handle if everything went fine
+ */
+int run_script(const char *relative, Procedure *proc, struct fuse_file_info *fi) {
+#ifdef TRACE
+	fprintf(stderr,"run_script(%s, %p, %p)\n", relative, proc, fi);
+#endif
+	char temp_filename[sizeof(persistent.tmp_template)];
+	strncpy(temp_filename, persistent.tmp_template, sizeof temp_filename-1);
+	temp_filename[sizeof temp_filename-1] = 0;
+	int handle = mkstemp(temp_filename);
+	if (handle <= 0) return -errno;
+	unlink(temp_filename);
+	proc->program->func(proc->program, relative, handle);
+	if (fi) fi->direct_io=1;	// Force use of FUSE read on this file and do not take into account
+	return handle;
+}
+
+/**
  * \brief Initialize the filesystem
  *
  * This function does all the technical stuff which has to be done before the start of the program. In particular, it allocates storage for the structures in memory and defines some of the callback functions used when a script is executed. The fuse_conn_info structure tells which capabilities FUSE provides and which one are needed and activated by the client. The function returns a pointer which will be available in all file operations later.
  * \param conn Capabilities requested by the application
+ * \param cfg Fuse configuration
  * \return Pointer to a persistent structure, available in future file operations
  */
-void *sfs_init(struct fuse_conn_info *conn) {
+void *sfs_init(struct fuse_conn_info *conn,
+	       struct fuse_config *cfg) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_init\n");
 #endif
 	// Setup connection
-	conn->async_read=0;
 	conn->want=0;
 	return 0;
 }
@@ -148,36 +177,41 @@ void sfs_destroy(void *private_data) {
  * This function loads the attributes of a chosen file and stores it in the stbuf variable. It is used if no file handle is provided through a fuse_file_info structure.
  * \param path Virtual path of the file on the remote file system
  * \param stbuf Structure in which the attributes will be stored
+ * \param fi File info structure (not used)
  * \return Error code, 0 if everything went fine
  */
-int sfs_getattr(const char *path,struct stat *stbuf) {
+int sfs_getattr(const char *path,struct stat *stbuf, struct fuse_file_info *fi) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_getattr(%s)\n",path);
 #endif
-	char *relative=relative_path(path);
-	int code=fstatat(persistent.mirror_fd,relative,stbuf,AT_SYMLINK_NOFOLLOW);
-	if (code==0 && S_ISREG(stbuf->st_mode) && (stbuf->st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))!=0 && get_script(persistent.procs,relative)!=0) stbuf->st_mode&= (~(S_IWUSR | S_IWGRP | S_IWOTH));   // If the file is a script, remove write access to everyone (for now we don't handle writing on scripts)
-	free(relative);
-	return (code==0)?0:-errno;
-}
+	int code;
+	if (path) {
+		Procedure *proc = NULL;
+		char *relative=relative_path(path);
+		code=fstatat(persistent.mirror_fd,relative,stbuf,AT_SYMLINK_NOFOLLOW);
+		if (!code && S_ISREG(stbuf->st_mode) && (proc = get_script(persistent.procs, relative))) {
+			// If the file is a script, remove write access to everyone (for now we don't handle writing on scripts)
+			stbuf->st_mode &= (~(S_IWUSR | S_IWGRP | S_IWOTH));
+			// If we want the actual size of the output, have to run the script and look
+			if (persistent.return_real_size) {
+				struct stat realsize;
 
-/**
- * \brief Get the attributes of a file on the virtual filesystem
- *
- * This function loads the attributes of a chosen file and stores it in the stbuf variable. It is used if a file handle is provided through a fuse_file_info structure.
- * \param path Virtual path of the file on the remote file system, not used because the file handle is available
- * \param stbuf Structure in which the attributes will be stored
- * \param fi FUSE file information structure, holding the handle to the mirror file
- * \return Error code, 0 if everything went fine
- */
-int sfs_fgetattr(const char *path,struct stat *stbuf,struct fuse_file_info *fi) {
+				int handle = run_script(relative, proc, fi);
+				int rstat_code = fstat(handle, &realsize);
+				if (!rstat_code) {
 #ifdef TRACE
-	fprintf(stderr,"sfs_fgetattr(%p)\n",(fi==0)?0:(void*)(long)(fi->fh));
+					fprintf(stderr, "sfs_getattr: Changing size from %ld to %zu\n", stbuf->st_size, realsize.st_size);
 #endif
-	if (fi==0 || fi->fh==0) return -EBADF;
-	FileStruct *fs=(FileStruct*)(long)(fi->fh);
-	int code=fstatat(persistent.mirror_fd,fs->filename,stbuf,0);
-	if (code==0 && S_ISREG(stbuf->st_mode) && (stbuf->st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))!=0 && fs->type==T_SCRIPT) stbuf->st_mode&= (~(S_IWUSR | S_IWGRP | S_IWOTH));	// If the file is a script, remove write access to everyone (for now we don't handle writing on scripts)
+					stbuf->st_size = realsize.st_size;
+				}
+				close(handle);
+			}
+		}
+		free(relative);
+	} else {
+		if (fi==NULL) return -EBADF;
+		code=fstat(fi->fh, stbuf);
+	}
 	return (code==0)?0:-errno;
 }
 
@@ -235,15 +269,21 @@ int sfs_readlink(const char *path,char *buf,size_t size) {
  * \param fi FUSE information on the directory, which contains the file handle, filled in by the function
  * \return 0 if everything went fine, another value otherwise
  */
-int sfs_opendir(const char *path,struct fuse_file_info *fi) {
+int sfs_opendir(const char *path, struct fuse_file_info *fi) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_opendir(%s,%p)\n",path,(fi==0)?0:(void*)(long)(fi->fh));
 #endif
 	char *relative=relative_path(path);
 	int fd=openat(persistent.mirror_fd,relative,O_RDONLY);
-	if (fd<0) {free(relative);return -errno;}
+	if (fd<0) {
+		free(relative);
+		return -errno;
+	}
 	DIR* handle=fdopendir(fd);
-	if (handle==0) {free(relative);return -errno;}
+	if (handle==0) {
+		if (relative) free(relative);
+		return -errno;
+	}
 	FileStruct *fs=(FileStruct*)malloc(sizeof(FileStruct));
 	fs->type=T_FOLDER;
 	fs->dir_handle=(void*)handle;
@@ -263,12 +303,15 @@ int sfs_opendir(const char *path,struct fuse_file_info *fi) {
  * \param filler Filler function provided by the FUSE system
  * \param offset Offset of the next directory entry, in the case files are provided one by one
  * \param fi File information structure
+ * \param rf Readdir flags for plus mode (not used)
  * \return 0 if there are no more files or if the filler function returned a non-null value, another value otherwise
  */
-int sfs_readdir(const char *path,void *buf,fuse_fill_dir_t filler,off_t offset,struct fuse_file_info *fi) {
+int sfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
+		struct fuse_file_info *fi, enum fuse_readdir_flags rf) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_readdir(%s,%p)\n",path,(fi==0)?0:(void*)(long)(fi->fh));
 #endif
+	(void) rf;
 	if (fi==0 || fi->fh==0) return -EBADF;
 	FileStruct *fs=(FileStruct*)(long)(fi->fh);
 	if (fs->type!=T_FOLDER) return -ENOTDIR;
@@ -278,7 +321,7 @@ int sfs_readdir(const char *path,void *buf,fuse_fill_dir_t filler,off_t offset,s
 		errno=0;
 		entry=readdir(handle);
 		if (entry==0) return -errno;
-		filler(buf,entry->d_name,0,0);
+		filler(buf,entry->d_name, 0, 0, 0);
 	} while (entry!=0);
 	return 0;
 }
@@ -400,15 +443,16 @@ int sfs_link(const char* from,const char *to) {
  * This function changes the name of a file or a directory in the virtual file system. This is the same as changing the name in the mirror file system.
  * \param from Path of the source file in the virtual file system
  * \param to Path of the destination in the virtual file system
+ * \param flags Governs whether should be atomic or not
  * \return Error code, or 0 if everything went fine
  */
-int sfs_rename(const char *from,const char *to) {
+int sfs_rename(const char *from,const char *to, unsigned int flags) {
 #ifdef  TRACE
 	fprintf(stderr,"sfs_rename(%s,%s)\n",from,to);
 #endif
 	char *relative_from=relative_path(from);
 	char *relative_to=relative_path(to);
-	int code=renameat(persistent.mirror_fd,relative_from,persistent.mirror_fd,relative_to);
+	int code=renameat2(persistent.mirror_fd, relative_from, persistent.mirror_fd, relative_to, flags);
 	free(relative_from);
 	free(relative_to);
 	return (code==0)?0:-errno;
@@ -422,16 +466,24 @@ int sfs_rename(const char *from,const char *to) {
  * \param mode New permissions of the file, which will replace the old ones
  * \return Error code, or 0 if everything went fine
  */
-int sfs_chmod(const char *path,mode_t mode) {
+int sfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_chmod(%s,%X)\n",path,mode);
 #endif
-	char *relative=relative_path(path);
 	struct stat stbuf;
-	int code=fstatat(persistent.mirror_fd,relative,&stbuf,0);
-	if (code==0 && S_ISREG(stbuf.st_mode) && (mode & (S_IWUSR | S_IWGRP | S_IWOTH))!=0 && get_script(persistent.procs,relative)!=0) mode&= (~(S_IWUSR | S_IWGRP | S_IWOTH));	// If the file is a script, remove write access to the requested permissions
-	code=fchmodat(persistent.mirror_fd,relative,mode,0);
-	free(relative);
+	int code;
+	if (path) {
+		char *relative=relative_path(path);
+		code=fstatat(persistent.mirror_fd, relative, &stbuf, 0);
+		if (code==0 && S_ISREG(stbuf.st_mode) && (mode & (S_IWUSR | S_IWGRP | S_IWOTH))!=0 && get_script(persistent.procs,relative)!=0) mode&= (~(S_IWUSR | S_IWGRP | S_IWOTH));	// If the file is a script, remove write access to the requested permissions
+		code=fchmodat(persistent.mirror_fd, relative, mode, 0);
+		free(relative);
+	} else {
+		if (fi==NULL) return -EBADF;
+		// TODO: This does NOT do the script check above b/c get_script requires a filename we do not have
+		code=fchmod(fi->fh, mode);
+	}
+
 	return (code==0)?0:-errno;
 }
 
@@ -443,40 +495,30 @@ int sfs_chmod(const char *path,mode_t mode) {
  * \param size Final size of the file
  * \return Error code, or 0 if everything went fine
  */
-int sfs_truncate(const char *path,off_t size) {
+int sfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_truncate(%s,%li)\n",path,(long)size);
 #endif
-	char *relative=relative_path(path);
 	struct stat stbuf;
-	int code=fstatat(persistent.mirror_fd,relative,&stbuf,0);
-	if (code==0 && S_ISREG(stbuf.st_mode) && get_script(persistent.procs,relative)!=0) {free(relative);return -EACCES;}	// Writing on a script is forbidden
-	int fd=openat(persistent.mirror_fd,relative,O_WRONLY);
-	free(relative);
+	uint64_t fd;
+	int code;
+	if (path) {
+		char *relative=relative_path(path);
+		code=fstatat(persistent.mirror_fd,relative,&stbuf,0);
+		if (code==0 && S_ISREG(stbuf.st_mode) && get_script(persistent.procs,relative)!=0) {
+			free(relative);
+			return -EACCES;
+		}	// Writing on a script is forbidden
+		fd=openat(persistent.mirror_fd,relative,O_WRONLY);
+		free(relative);
+	} else {
+		if (fi == NULL) return -EBADF;
+		fd = fi->fh;
+		// TODO: This does NOT do the script check above b/c get_script requires a filename we do not have
+	}
 	if (fd<0) return -errno;
 	code=ftruncate(fd,size);
 	close(fd);
-	return (code==0)?0:-errno;
-}
-
-/**
- * \brief Truncate a file in a virtual file system so that it has the desired size
- *
- * This function truncates a file in the virtual file system to the desired size given as a parameter. It is the same as the above one except that it makes use of the file handle from the fi structure instead of the path name.
- * \param path Virtual path of the file, unused because the file handle is available
- * \param size Final size of the file
- * \param fi FUSE file information structure, holding the handle to the mirror file
- * \return Error code, or 0 if everything went fine
- */
-int sfs_ftruncate(const char *path,off_t size,struct fuse_file_info *fi) {
-#ifdef TRACE
-	fprintf(stderr,"sfs_ftruncate(%li,%p)\n",(long)size,(fi==0)?0:(void*)(long)(fi->fh));
-#endif
-	if (fi==0 || fi->fh==0) return -EBADF;
-	FileStruct *fs=(FileStruct*)(long)(fi->fh);
-	if (fs->type==T_FOLDER) return -EISDIR;
-	if (fs->type==T_SCRIPT) return -EACCES;	// Writing on a script is forbidden
-	int code=ftruncate(fs->file_handle,size);
 	return (code==0)?0:-errno;
 }
 
@@ -486,18 +528,28 @@ int sfs_ftruncate(const char *path,off_t size,struct fuse_file_info *fi) {
  * This function updates the last access time from the first element of the array in parameter, and the last modification time from the second element of the same array. It only transfers the order to the mirror file system.
  * \param path Virtual path of the file
  * \param ts Array of two elements holding the two time structures of the last access and last modification time which the file will have after the execution
+ * \param fi File information (not used)
  * \return Error code, or 0 if everything went fine
  */
-int sfs_utimens(const char *path,const struct timespec ts[2]) {
+int sfs_utimens(const char *path, const struct timespec ts[2], struct fuse_file_info *fi) {
 #ifdef TRACE
 	fprintf(stderr,"sfs_utimens(%s)\n",path);
 #endif
-	char *relative=relative_path(path);
 	struct stat stbuf;
-	int code=fstatat(persistent.mirror_fd,relative,&stbuf,0);
-	if (code==0 && S_ISREG(stbuf.st_mode) && get_script(persistent.procs,relative)!=0) {free(relative);return -EACCES;}	// Writing on a script is forbidden
-	code=utimensat(persistent.mirror_fd,relative,ts,0);
-	free(relative);
+	int code;
+	if (path) {
+		char *relative=relative_path(path);
+		code=fstatat(persistent.mirror_fd,relative,&stbuf,0);
+		if (code==0 && S_ISREG(stbuf.st_mode) && get_script(persistent.procs,relative)!=0) {
+			free(relative);
+			return -EACCES;
+		}	// Writing on a script is forbidden
+		code=utimensat(persistent.mirror_fd, relative, ts, 0);
+		free(relative);
+	} else {
+		code = futimens(fi->fh, ts);
+		// TODO: This does NOT do the script check above b/c get_script requires a filename we do not have
+	}
 	return (code==0)?0:-errno;
 }
  
@@ -520,7 +572,7 @@ int sfs_statfs(const char *path,struct statvfs *stbuf) {
 /**
  * \brief Open a file in the virtual file system
  *
- * This function opens a file in the virtual file system. If the file is not a script file, this is the same as opening it on the mirror file system and saving its handle in the file info structure fi. If the file is a script file, the function executes the script, saves its content on a temporary file, and opens the latter for reading. The temporary file is unlinked immediatly so that the user does not have to worry about erasing it when it is closed. The function also checks if the open mode (in the fi->flags variable) are allowed for this file.
+ * This function opens a file in the virtual file system. If the file is not a script file, this is the same as opening it on the mirror file system and saving its handle in the file info structure fi. If the file is a script file, the function executes the script, saves its content on a temporary file, and opens the latter for reading. The temporary file is unlinked immediately so that the user does not have to worry about erasing it when it is closed. The function also checks if the open mode (in the fi->flags variable) are allowed for this file.
  * \param path Virtual path of the file
  * \param fi File information structure, filled by the function with the handle of the mirror file
  * \return Error code, or 0 if everything went fine
@@ -533,15 +585,19 @@ int sfs_open(const char *path,struct fuse_file_info *fi) {
 	int typ=0;
 	char *relative=relative_path(path);
 	Procedure *proc=get_script(persistent.procs,relative);
-	if (proc!=0) {	// If the file is a script, the interpretor is executed to produce the result of the script
-		if ((fi->flags & O_WRONLY)!=0 || (fi->flags & O_RDWR)!=0) {free(relative);return -EACCES;} 	// If the caller requests to open the file in one of the write modes, immediatly abort the opening
-		char temp_filename[]="/tmp/sfs.XXXXXX";
-		handle=mkstemp(temp_filename);
-		if (handle<=0) {free(relative);return -errno;}
-		unlink(temp_filename);
-		proc->program->func(proc->program,relative,handle);
+	if (proc!=0) {	// If the file is a script, the interpreter is executed to produce the result of the script
+		// If the caller requests to open the file in one of the write modes, immediately abort the opening
+		if ((fi->flags & O_WRONLY)!=0 || (fi->flags & O_RDWR)!=0) {
+			free(relative);
+			return -EACCES;
+		}
+
+		handle = run_script(relative, proc, fi);
+		if (handle <= 0) {
+			free(relative);
+			return handle;
+		}
 		typ=1;
-		fi->direct_io=1;	// Force use of FUSE read on this file and do not take into account size given by the stat function
 	} else {
 		handle=openat(persistent.mirror_fd,relative,fi->flags);
 		if (handle<=0) {free(relative);return -errno;}
@@ -595,7 +651,7 @@ int sfs_read(const char *path,char *buf,size_t size,off_t offset,struct fuse_fil
  */
 int sfs_write(const char *path,const char *buf,size_t size,off_t offset,struct fuse_file_info *fi) {
 #ifdef TRACE
-	fprintf(stderr,"sfs_write(%*.*s,%zi,%li,%p)\n",size,size,buf,size,(long)offset,(fi==0)?0:(void*)(long)(fi->fh));
+	fprintf(stderr,"sfs_write(%zi,%li,%p)\n", size, (long)offset, (fi==0)?0:(void*)(long)(fi->fh));
 #endif
 	if (fi==0 || fi->fh==0) return -EBADF;
 	FileStruct *fs=(FileStruct*)(long)(fi->fh);
@@ -693,6 +749,19 @@ int sfs_create(const char *path,mode_t mode,struct fuse_file_info *fi) {
 	return 0;
 }
 
+static off_t sfs_lseek(const char *path, off_t off, int whence, struct fuse_file_info *fi)
+{
+#ifdef TRACE
+	fprintf(stderr,"sfs_lseek(%p)\n",(fi==0)?0:(void*)(long)(fi->fh));
+#endif
+	if (fi==0 || fi->fh==0) return -EBADF;
+	FileStruct *fs=(FileStruct*)(long)(fi->fh);
+	if (fs->type==T_FOLDER) return -EISDIR;
+	off_t res=lseek(fs->file_handle, off, whence);
+	if (res<0) return -errno;
+	return 0;
+	}
+
 /**
  * \brief List of callback functions
  *
@@ -702,7 +771,6 @@ struct fuse_operations sfs_oper = {
 	.init=sfs_init,
 	.destroy=sfs_destroy,
 	.getattr=sfs_getattr,
-	.fgetattr=sfs_fgetattr,
 	.access=sfs_access,
 	.readlink=sfs_readlink,
 	.symlink=sfs_symlink,
@@ -716,7 +784,6 @@ struct fuse_operations sfs_oper = {
 	.rename=sfs_rename,
 	.chmod=sfs_chmod,
 	.truncate=sfs_truncate,
-	.ftruncate=sfs_ftruncate,
 	.utimens=sfs_utimens,
 	.statfs=sfs_statfs,
 	.open=sfs_open,
@@ -726,18 +793,21 @@ struct fuse_operations sfs_oper = {
 	.fsync=sfs_fsync,
 	.create=sfs_create,
 	.flush=sfs_flush,
-	.flag_nullpath_ok=0	// Indicates that some functions can receive a null path as argument because they get the location of their operand from the file handle
+	.lseek=sfs_lseek,
 };
 
 /**
  * \brief Main program, mounts file system
  *
  * The main program processes command line arguments and mounts the file system. In addition to standard \e fusermount command parameters, possible command line arguments are:
+ * 	Syntax: scriptfs [-l] [-p procedure|--procedure=procedure...] mirror_path mountpoint
+ * 
  * 	- -p procedure
  * 		--procedure=procedure
  * 			Define an execution procedure. This procedure holds the external executable program and the test program that will be used on files. The command can be repeated as many times as needed, and each procedure will be tested in the order they appear in the command-line. For more information about the way to define a procedure, see \ref syntaxdoc "Syntax of command-line".
- * 	Syntax: scriptfs [-p procedure|--procedure=procedure...] mirror_path mountpoint
- * 
+ *      - -l
+ *              Report final output size (in `stat`/`getattr`) instead of size of source script.
+ *
  * \param argc Number of command line arguments, including the name of the calling program
  * \param argv Array of command line arguments, the first one being the path to the calling program
  * \return Error code, 0 if everything went fine
@@ -749,12 +819,33 @@ int main(int argc,char **argv,char **envp) {
 	persistent.envp=envp;
 	// Parse command line arguments
 	init_resources();
+	struct stat sb;
+	int scode;
+	scode = stat("/dev/shm", &sb);
+	if (!scode && ((sb.st_mode & S_IFMT) == S_IFDIR)) {
+		strncpy(persistent.tmp_template, "/dev/shm/sfs.XXXXXX", sizeof(persistent.tmp_template));
+	} else {
+		strncpy(persistent.tmp_template, "/tmp/sfs.XXXXXX", sizeof(persistent.tmp_template));
+	}
+#ifdef TRACE
+	fprintf(stderr, "main: Using %s as a temporary file template\n", persistent.tmp_template);
+#endif
 	size_t i,j;
 	Procedures *last=0;
 	for (i=1;i<argc && argv[i][0]=='-';++i) {
 		if (argv[i][1]=='o') ++i;	// Skip -o options parameters
+		else if (argv[i][1]=='l') { // Parse -l option (always report real file length)
+			persistent.return_real_size = 1;
+			for (j=i;j<argc;++j) argv[j]=argv[j+1];
+			--argc;
+			--i;
+		}
 		else if (argv[i][1]=='p') { // Parse -p options parameters
-			if (i>=argc-1) print_usage(EX_USAGE);
+			if (i>=argc-1) {
+				fprintf(stderr, "-p needs an argument\n");
+				free_resources();
+				print_usage(EX_USAGE);
+			}
 			Procedure *proc=get_procedure_from_string(argv[i+1]);
 			if (proc!=0) {
 				Procedures *procs=(Procedures*)malloc(sizeof(Procedures));
@@ -762,13 +853,40 @@ int main(int argc,char **argv,char **envp) {
 				procs->next=0;
 				if (last==0) persistent.procs=procs; else last->next=procs;
 				last=procs;
+			} else {
+				free_resources();
+				fprintf(stderr, "-p option failed\n");
+				exit(1);
 			}
 			for (j=i;j<argc-2;++j) argv[j]=argv[j+2];
 			argc-=2;
 			--i;
+#ifdef TRACE
+			if (proc && proc->program)
+				fprintf(stderr, "Program name is %s\n", proc->program->path);
+#endif
 		}
 	}
-	if ((argc-i)!=2) print_usage(EX_USAGE);
+	if ((argc-i)!=2) {
+		fprintf(stderr, "See %ld parameters; need a mirror_folder and a mount_point, and no more\n",
+		       argc-i);
+		free_resources();
+		print_usage(EX_USAGE);
+	}
+	scode = stat(argv[i], &sb);
+	if (scode || ((sb.st_mode & S_IFMT) != S_IFDIR)) {
+		fprintf(stderr, "mirror_folder %s doesn't exist or is not a directory\n", argv[i]);
+		free_resources();
+		return ENOENT;
+	}
+		
+	scode = stat(argv[i+1], &sb);
+	if (scode || ((sb.st_mode & S_IFMT) != S_IFDIR)) {
+		fprintf(stderr, "mount_point %s doesn't exist or is not a directory\n", argv[i+1]);
+		free_resources();
+		return ENOENT;
+	}
+		
 	persistent.mirror=realpath(argv[i],0);
 	persistent.mirror_len=strlen(persistent.mirror);
 	argv[i]=argv[i+1];
@@ -799,7 +917,7 @@ int main(int argc,char **argv,char **envp) {
 		persistent.procs->next=0;
 	}
 	// Daemonize the program
-	int code=fuse_main(argc,argv,&sfs_oper,0);
+	int code=fuse_main(argc, argv, &sfs_oper, NULL);
 	free_resources();
 	close(persistent.mirror_fd);
 	return code;

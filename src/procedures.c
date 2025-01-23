@@ -7,17 +7,18 @@
  *
  *    Description:  Implementation of procedures
  *
- *        Version:  1.0
- *        Created:  03/06/2012 20:16:52
+ *        Version:  2.0
+ *        Created:  01/25/2025
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  François Hissel
+ *         Author:  Eric Ewanco (2.0) François Hissel (1.0)
  *        Company:  
  *
  * =====================================================================================
  */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,34 +50,34 @@ char *read_word(const char **str) {
 	int state=1;
 	while (*s!=0 && state!=0 && num<MAX_PATH_LENGTH-1) {
 		switch (state) {
-			case 1:
-				if (*s=='"') state=2;
-				else if (*s=='\'') state=3;
-				else if (*s=='\\') state=4;
-				else if (*s==' ' || *s=='\n' || *s=='\t') state=0;
-				else word[num++]=*s;
-				break;
-			case 2:
-				if (*s=='"') state=1;
-				else if (*s=='\\') state=5;
-				else word[num++]=*s;
-				break;
-			case 3:
-				if (*s=='\'') state=1;
-				else word[num++]=*s;
-				break;
-			case 4:
-				if (*s=='\'' || *s=='"' || *s=='\\') word[num++]=*s;
-				else if (*s=='t') word[num++]='\t';
-				else if (*s=='n') word[num++]='\n';
-				else if (*s=='r') word[num++]='\r';
-				state=1;
-				break;
-			case 5:
-				if (*s=='"' || *s=='\\') word[num++]=*s;
-				else {word[num++]='\\';word[num++]=*s;}
-				state=2;
-				break;
+		case 1:
+			if (*s=='"') state=2;
+			else if (*s=='\'') state=3;
+			else if (*s=='\\') state=4;
+			else if (*s==' ' || *s=='\n' || *s=='\t') state=0;
+			else word[num++]=*s;
+			break;
+		case 2:
+			if (*s=='"') state=1;
+			else if (*s=='\\') state=5;
+			else word[num++]=*s;
+			break;
+		case 3:
+			if (*s=='\'') state=1;
+			else word[num++]=*s;
+			break;
+		case 4:
+			if (*s=='\'' || *s=='"' || *s=='\\') word[num++]=*s;
+			else if (*s=='t') word[num++]='\t';
+			else if (*s=='n') word[num++]='\n';
+			else if (*s=='r') word[num++]='\r';
+			state=1;
+			break;
+		case 5:
+			if (*s=='"' || *s=='\\') word[num++]=*s;
+			else {word[num++]='\\';word[num++]=*s;}
+			state=2;
+			break;
 		}
 		++s;
 	}
@@ -90,7 +91,7 @@ char *read_word(const char **str) {
 /**
  * \brief Analyze a command and extract the name of the executable and the arguments
  *
- * This function analyzes the command in string str as it was a command-line in a shell. The first word is the name of the executable and is sved in the path variable. All other words or group of letters delimitated by quotes are saved in the args array, the first element of this array is again the name of the executable. A null pointer is added at the end of the array. Finally if an exclamation mark is found in one argument, this word is not saved in the args element and the element at the corresponding position is set to a null pointer, while the position is saved in the filearg variable.
+ * This function analyzes the command in string str as it was a command-line in a shell. The first word is the name of the executable and is saved in the path variable. All other words or group of letters delimitated by quotes are saved in the args array, the first element of this array is again the name of the executable. A null pointer is added at the end of the array. Finally if an exclamation mark is found in one argument, this word is not saved in the args element and the element at the corresponding position is set to a null pointer, while the position is saved in the filearg variable.
  * \param str String which will be tokenized
  * \param path Pointer to the name of the executable, initialized by the function
  * \param args Pointer to an array of arguments, initialized by the function
@@ -149,10 +150,22 @@ Program *get_program_from_string(const char *str) {
 		if (prog->path!=0) {
 			struct stat fileinfo;
 			if (!(stat(prog->path,&fileinfo)==0 && S_ISREG(fileinfo.st_mode) && access(prog->path,X_OK)==0)) {
-				fprintf(stderr,"%s can not be found or executed\n",prog->path);
+				fprintf(stderr,"%s program can not be found or executed\n",prog->path);
 			} else {
+				char *oldpath = prog->path;
 				prog->func=&program_external;
 				prog->filter=1;
+				// Canonicalize filter so it works anywhere
+				prog->path = realpath(oldpath, NULL);
+				free(oldpath);
+				// the tokenize function puts a copy of the filter into args[0], fix up
+				oldpath = prog->args[0];
+				prog->args[0] = strdup(prog->path);
+				free(oldpath);
+#ifdef TRACE
+				fprintf(stderr, "get_program_from_string: Canonical path is %s\n",
+					prog->path);
+#endif
 			}
 		}
 	}
@@ -206,10 +219,22 @@ Test *get_test_from_string(const char *str) {
 		if (test->path!=0) {
 			struct stat fileinfo;
 			if (!(stat(test->path,&fileinfo)==0 && S_ISREG(fileinfo.st_mode) && access(test->path,X_OK)==0)) {
-				fprintf(stderr,"%s can not be found or executed\n",test->path);
+				fprintf(stderr,"%s test can not be found or executed\n",test->path);
 			} else {
+				char *oldpath = test->path;
 				test->func=&test_program;
 				test->filter=1;
+				// Canonicalize filter so it works anywhere
+				test->path = realpath(oldpath, NULL);
+				free(oldpath);
+				// the tokenize function puts a copy of the filter into args[0], fix up
+				oldpath = test->args[0];
+				test->args[0] = strdup(test->path);
+				free(oldpath);
+#ifdef TRACE
+				fprintf(stderr, "get_test_from_string: Canonical path is %s\n",
+					test->path);
+#endif
 			}
 		}
 	}

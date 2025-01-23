@@ -15,8 +15,8 @@ ifdef RELEASE
 else
 	COPTFLAGS=-O0 -ggdb3 -Werror -Wall
 endif
-CFLAGS=$(CINCFLAGS) $(COPTFLAGS) $(CPROFFLAGS) $(CTRACEFLAGS) `pkg-config fuse --cflags` 
-LFLAGS=`pkg-config fuse --libs` 
+CFLAGS=$(CINCFLAGS) $(COPTFLAGS) $(CPROFFLAGS) $(CTRACEFLAGS) `pkg-config fuse3 --cflags` 
+LFLAGS=`pkg-config fuse3 --libs` 
 
 PROJECT=scriptfs
 SRC_DIR=src

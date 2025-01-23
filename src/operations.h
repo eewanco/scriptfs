@@ -39,6 +39,8 @@ struct Persistent {
 	size_t mirror_len;	//!< Length of the mirror string
 	int mirror_fd;	//!< File descriptor of the mirror folder
 	Procedures *procs;	//!< List of procedures describing what to do with files
+	char tmp_template[FILENAME_MAX_LENGTH]; //! Temp file template, either /tmp/sfs.XXXXXX or /dev/shm/sfs.XXXXXX
+	int return_real_size; //! If non-zero, getattr always executes the script to return the real size rather than the script size
 };
 
 /**

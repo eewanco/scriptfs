@@ -1,0 +1,4 @@
+#!/bin/bash
+
+echo I was passed: "$@"
+echo "$(date) $1" >> /tmp/args.log

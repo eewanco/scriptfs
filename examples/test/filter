@@ -1,0 +1,3 @@
+#!/bin/bash
+
+awk -F "\n" '{print FNR,$0;}' $1
